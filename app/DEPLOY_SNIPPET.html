@@ -1,0 +1,15 @@
+<h3>Deploy commands</h3>
+<div class="code-block"><div class="code-header"><span class="code-lang">bash</span><button class="btn-copy" onclick="copyCode(this)">Copy</button></div><pre><code>cd lab2-react-app
+
+# Verify the connection and resolve app.yml values (writes nothing)
+snow connection test --connection &lt;your_connection&gt;
+snow app setup --app-name=closeup_agent_chat --dry-run --connection &lt;your_connection&gt;
+
+# Build and deploy the APPLICATION SERVICE
+snow app deploy --verbose --connection &lt;your_connection&gt;
+
+# Get the app URL
+snow app open --print-only --connection &lt;your_connection&gt;
+
+# Share the app with analysts
+snow sql --connection &lt;your_connection&gt; -q &quot;GRANT USAGE ON APPLICATION SERVICE CLOSEUP_HOL2.APPS.CLOSEUP_AGENT_CHAT TO ROLE HOL_ANALYST&quot;</code></pre></div>

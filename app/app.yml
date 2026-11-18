@@ -1,0 +1,48 @@
+# created-by: snowflake-apps-create; template=nextjs-template; skill-version=1.0.0
+# Single-file app.yml v2 manifest (Snowflake CLI >= 3.26). Deployment values below
+# were NOT resolved by `snow app setup` (no CLI connection was available when this
+# was written). Before the first deploy run:
+#   snow app setup --app-name=closeup_agent_chat --dry-run --connection <conn>
+# and copy database/schema/query_warehouse/build_eai from its output if they differ.
+version: 2
+runtime: node
+
+name: CLOSEUP_AGENT_CHAT
+database: CLOSEUP_HOL2
+schema: APPS
+query_warehouse: CLOSEUP_HOL2_WH
+# build_eai: <NPM_EGRESS_EAI>      # set if the dry run reports one; `npm ci` in the builder needs egress
+
+label: Close-Up Market Intelligence Assistant
+description: Chat UI for the PHARMA_MARKET_AGENT Cortex Agent (Cortex Analyst + Cortex Search).
+icon: public/icon.svg
+
+ignore:
+  - node_modules
+  - .next
+  - .git
+  - .env*
+
+install:
+  commands:
+    - ["npm", "ci", "--include=dev"]
+
+build:
+  commands:
+    - ["npm", "run", "build"]
+    # For standalone mode
+    - ["cp", "-r", ".next/static", ".next/standalone/.next/static"]
+    - ["cp", "-r", "public", ".next/standalone/public"]
+    # Avoid packaging extra node_modules since standalone includes its own
+    - ["rm", "-rf", "node_modules"]
+
+run:
+  command: ["node", ".next/standalone/server.js"]
+
+environment_variables:
+  - name: AGENT_DB
+    value: "CLOSEUP_HOL2"
+  - name: AGENT_SCHEMA
+    value: "APPS"
+  - name: AGENT_NAME
+    value: "PHARMA_MARKET_AGENT"
