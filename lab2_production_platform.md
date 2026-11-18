@@ -1,6 +1,6 @@
 # Production-Grade Data & AI Platform
 
-**⏱ ~115 min · ▲ Advanced · ☰ 4 challenge blocks**
+**⏱ ~130 min (14:00–17:00) · ▲ Advanced · ☰ 4 challenge blocks**
 
 > This is the Markdown version of the guide, for reading on GitHub. For **Copy** buttons and progress tracking, download and open `lab2_production_platform.html` in your browser.
 
@@ -11,11 +11,11 @@
 - [Step 3: CDC with Streams + Tasks (~15 min)](#step-3-cdc-with-streams--tasks-15-min)
 - [Step 4: Declarative Pipelines with Dynamic Tables (~20 min)](#step-4-declarative-pipelines-with-dynamic-tables-20-min)
 - [Step 5: Dev Lifecycle: Clone, Swap, Undrop (Optional)](#step-5-dev-lifecycle-clone-swap-undrop-optional)
-- [Step 6: Security & Roles (~20 min)](#step-6-security--roles-20-min)
+- [Step 6: Security & Roles (~25 min)](#step-6-security--roles-25-min)
 - [Step 7: Semantic View via SQL (~10 min)](#step-7-semantic-view-via-sql-10-min)
-- [Step 8: Cortex Search + Cortex Agent via SQL (~15 min)](#step-8-cortex-search--cortex-agent-via-sql-15-min)
-- [Step 9: Consumption APIs (SQL API & Agents REST API) (~5 min · Instructor demo)](#step-9-consumption-apis-sql-api--agents-rest-api-5-min--instructor-demo)
-- [Step 10: React App on Snowflake App Runtime (~5 min · Instructor demo)](#step-10-react-app-on-snowflake-app-runtime-5-min--instructor-demo)
+- [Step 8: Cortex Search + Cortex Agent via SQL (~20 min)](#step-8-cortex-search--cortex-agent-via-sql-20-min)
+- [Step 9: Consumption APIs (SQL API & Agents REST API) (~7 min · Instructor demo)](#step-9-consumption-apis-sql-api--agents-rest-api-7-min--instructor-demo)
+- [Step 10: React App on Snowflake App Runtime (~8 min · Instructor demo)](#step-10-react-app-on-snowflake-app-runtime-8-min--instructor-demo)
 - [Step 11: Cleanup (After the event)](#step-11-cleanup-after-the-event)
 
 ## Overview
@@ -46,14 +46,14 @@ Internal Stages · COPY INTO · Schema Evolution · Streams · Tasks · Dynamic 
 
 | Time | Block | Steps |
 | --- | --- | --- |
-| 14:00 | Kick-off, teams & rules | — |
-| 14:10 | Block 1 — Land the data | 1–2 |
-| 14:35 | Block 2 — Make it flow | 3–4 |
-| 15:10 | Break | — |
-| 15:20 | Block 3 — Lock it down | 6 |
-| 15:40 | Block 4 — Make it talk | 7–8 |
-| 16:05 | Instructor demo: APIs + React app on SAR | 9–10 |
-| 16:15 | Results, Q&A and next steps | — |
+| 14:00 | Opening: why Snowflake in Close-Up projects | — |
+| 14:15 | The challenge: end-to-end architecture, checkpoints and account access | — |
+| 14:30 | Block 1 — Data: resilient ingestion, CDC with Streams + Tasks, Dynamic Tables and SCD | 1–4 |
+| 15:30 | Break | — |
+| 15:40 | Block 2 — Security & roles | 6 |
+| 16:05 | Block 3 — AI: semantic view and agent with a dedicated role | 7–8 |
+| 16:35 | Block 4 — Integrations (instructor demo): SQL API, Agents REST API, React app on Snowflake App Runtime | 9–10 |
+| 16:50 | Q&A and wrap-up | — |
 
 > **Skipped in the session:**  step 1.5 (budgets), step 5 (clone/swap/undrop) and
 > step 11 (cleanup). They stay in this guide so you can do them later at your own pace.
@@ -62,11 +62,11 @@ Internal Stages · COPY INTO · Schema Evolution · Streams · Tasks · Dynamic 
 
 > **Note:**  This lab uses Enterprise features (masking, row access). Step 6 shows Standard Edition alternatives.
 
-## Challenge Block 1 — Land the data (25 min · steps 1–2)
+## Challenge Block 1 — Data (60 min · steps 1–4)
 
-**Mission:** Create the platform skeleton and land the 7 source files with ingestion that survives bad rows and new columns.
+**Mission:** Build a production-grade pipeline: land the 7 source files with ingestion that survives bad rows and new columns, then propagate changes automatically with a Streams + Tasks DAG (CDC) and a Dynamic Table pipeline (incremental + SCD2).
 
-> **Checkpoint ✓**  The *Verify* blocks of steps 1 and 2 return the expected counts and the rejected rows are captured, not lost. When your team reaches the checkpoint, raise your hand (or post in the chat)
+> **Checkpoint ✓**  Two checkpoints: **(1)** after step 2, the *Verify* blocks of steps 1 and 2 return the expected counts and the rejected rows are captured, not lost; **(2)** after step 4, an insert in RAW shows up downstream without running anything manually and the step 4 *Verify* passes. When your team reaches the checkpoint, raise your hand (or post in the chat)
 > — the first team gets the point for this block.
 
 ---
@@ -583,13 +583,6 @@ SELECT
   (SELECT COUNT(*) FROM RAW.PRODUCT_PRICE_EVENTS)                           AS PRICE_EVENTS,     -- 240
   (SELECT COUNT(DISTINCT SOURCE_FILE) FROM RAW.SELL_OUT_LANDING)            AS FILES_LOADED;
 ```
-
-## Challenge Block 2 — Make it flow (35 min · steps 3–4)
-
-**Mission:** Propagate changes automatically: a Streams + Tasks DAG for CDC and a Dynamic Table pipeline (incremental + SCD2).
-
-> **Checkpoint ✓**  An insert in RAW shows up downstream without running anything manually, and the step 4 *Verify* passes. When your team reaches the checkpoint, raise your hand (or post in the chat)
-> — the first team gets the point for this block.
 
 ---
 
@@ -1218,16 +1211,16 @@ SELECT (SELECT COUNT(*) FROM CLOSEUP_HOL2.RAW.LABORATORIES WHERE SEGMENT IS NOT 
        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.DATABASES WHERE DATABASE_NAME = 'CLOSEUP_HOL2_DEV') AS DEV_DB_EXISTS;
 ```
 
-## Challenge Block 3 — Lock it down (20 min · step 6)
+## Challenge Block 2 — Security & roles (25 min · step 6)
 
-**Mission:** Set up functional and access roles, then make sure an analyst only sees what they should.
+**Mission:** Set up functional and access roles, reproduce and fix the classic privilege errors, then make sure an analyst only sees what they should.
 
 > **Checkpoint ✓**  Querying as `HOL_ANALYST` returns masked/filtered data and the step 6 *Verify* passes. When your team reaches the checkpoint, raise your hand (or post in the chat)
 > — the first team gets the point for this block.
 
 ---
 
-## Step 6: Security & Roles (~20 min)
+## Step 6: Security & Roles (~25 min)
 
 Most "roles always give us problems" stories come from three habits: granting privileges directly to people-facing roles, creating objects with whatever role happens to be active, and forgetting that new objects do not inherit old grants. This step fixes all three with a design you can copy, then breaks it on purpose so you recognize the error messages, and finishes with column masking and row-level security.
 
@@ -1580,9 +1573,9 @@ SHOW GRANTS TO ROLE AGENT_USER_ROLE;
 SELECT CURRENT_ROLE();   -- back to ACCOUNTADMIN for the next steps
 ```
 
-## Challenge Block 4 — Make it talk (25 min · steps 7–8)
+## Challenge Block 3 — AI (30 min · steps 7–8)
 
-**Mission:** Expose the GOLD layer to business users: semantic view, search service and a Cortex Agent, all in SQL.
+**Mission:** Expose the GOLD layer to business users: semantic view, search service and a Cortex Agent with a dedicated role, all in SQL.
 
 > **Checkpoint ✓**  The agent answers one quantitative question (sales/share) and one qualitative question (field notes) correctly. When your team reaches the checkpoint, raise your hand (or post in the chat)
 > — the first team gets the point for this block.
@@ -1814,7 +1807,7 @@ USE ROLE ACCOUNTADMIN;
 
 ---
 
-## Step 8: Cortex Search + Cortex Agent via SQL (~15 min)
+## Step 8: Cortex Search + Cortex Agent via SQL (~20 min)
 
 ### 8.1 Enrich field notes with AI functions
 
@@ -2013,9 +2006,14 @@ SHOW CORTEX SEARCH SERVICES IN SCHEMA CLOSEUP_HOL2.SEMANTIC;
 SHOW GRANTS ON AGENT CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;
 ```
 
+## Block 4 — Integrations (15 min · steps 9–10 · instructor demo)
+
+The instructor shows how applications consume the platform: the SQL API and the Cortex Agents REST API with a role-restricted PAT,
+and a React chat app deployed on Snowflake App Runtime. All code is in this repository (`app/`), so you can reproduce it after the session.
+
 ---
 
-## Step 9: Consumption APIs (SQL API & Agents REST API) (~5 min · Instructor demo)
+## Step 9: Consumption APIs (SQL API & Agents REST API) (~7 min · Instructor demo)
 
 > **Instructor demo.**  During the session the instructor runs this step live on screen.
 > Everything you need to reproduce it later is below.
@@ -2195,7 +2193,7 @@ SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER HOL2_API_USER;
 
 ---
 
-## Step 10: React App on Snowflake App Runtime (~5 min · Instructor demo)
+## Step 10: React App on Snowflake App Runtime (~8 min · Instructor demo)
 
 > **Instructor demo.**  During the session the instructor runs this step live on screen.
 > Everything you need to reproduce it later is below.
@@ -2329,8 +2327,8 @@ Run as ACCOUNTADMIN. Order matters: app first, then AI objects, the PAT, and fin
 ```sql
 USE ROLE ACCOUNTADMIN;
 
--- 1. App on Snowflake App Runtime (use the name from your deployment / README teardown)
--- DROP SERVICE IF EXISTS CLOSEUP_HOL2.APPS.<app_service_name>;
+-- 1. App on Snowflake App Runtime: the CLOSEUP_AGENT_CHAT application service lives in
+--    CLOSEUP_HOL2.APPS and is removed with the database in section 5.
 
 -- 2. Agent and search service
 DROP AGENT IF EXISTS CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;

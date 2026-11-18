@@ -3,8 +3,8 @@
 
 USE ROLE ACCOUNTADMIN;
 
--- 1. App on Snowflake App Runtime (use the name from your deployment / README teardown)
--- DROP SERVICE IF EXISTS CLOSEUP_HOL2.APPS.<app_service_name>;
+-- 1. App on Snowflake App Runtime: the CLOSEUP_AGENT_CHAT application service lives in
+--    CLOSEUP_HOL2.APPS and is removed with the database in section 5.
 
 -- 2. Agent and search service
 DROP AGENT IF EXISTS CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;
