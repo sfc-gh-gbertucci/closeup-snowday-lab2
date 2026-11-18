@@ -2,7 +2,7 @@
 
 An advanced hands-on lab, run as a challenge (26/11, 14:00–17:00, ~115 min in 4 blocks). It uses **synthetic pharma market data**. None of it is real Close-Up or customer data.
 
-**Guide:** [lab2_production_platform.html](lab2_production_platform.html)
+**Guide:** [lab2_production_platform.md](lab2_production_platform.md) (read on GitHub) · [interactive HTML version](lab2_production_platform.html) (download and open in your browser for Copy buttons and progress tracking)
 
 | Block | Steps | Topic |
 |---|---|---|
@@ -17,7 +17,8 @@ Step 5 (clone/swap/undrop) and step 1.5 (budgets) are optional.
 ## Repository contents
 
 ```
-lab2_production_platform.html   step-by-step guide
+lab2_production_platform.md     step-by-step guide (renders on GitHub)
+lab2_production_platform.html   same guide, interactive (Copy buttons, progress)
 sql/stepNN.sql                  every SQL block, one file per step
 app/                            React (Next.js) chat app for the Cortex Agent (step 10)
 ```
@@ -25,7 +26,7 @@ app/                            React (Next.js) chat app for the Cortex Agent (s
 ## How to use
 
 1. `git clone https://github.com/sfc-gh-gbertucci/closeup-snowday-lab2.git`, or use **Code → Download ZIP** and unzip it.
-2. Open `lab2_production_platform.html` in your browser and follow the steps in a Snowsight SQL worksheet.
+2. Read `lab2_production_platform.md` on GitHub, or open `lab2_production_platform.html` in your browser, and follow the steps in a Snowsight SQL worksheet.
 3. Step 9 creates a dedicated service user (`HOL2_API_USER`), a network policy for your IP and a role-restricted PAT. That is all a new account needs to call the APIs.
 4. Step 10 deploys `app/` to Snowflake App Runtime:
 
