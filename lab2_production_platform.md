@@ -346,6 +346,12 @@ Expected: 15 / 80 / 400 / 600 / 150,000 / 60,000 / 300 rows.
 
 ---
 
+### Recap: what you built in Step 1
+
+- **You built:** warehouse `CLOSEUP_HOL2_WH`, database `CLOSEUP_HOL2` with the layers `SOURCE_SYSTEM`, `RAW` (bronze), `SILVER`, `GOLD`, `SEMANTIC` and `APPS`, and the 7-table simulated source system. Optionally, the resource monitor `CLOSEUP_HOL2_RM` and the budget `CLOSEUP_HOL2_BUDGET`.
+- **You saw:** scaling the warehouse up and down in seconds, and the result cache returning a repeated query with no compute.
+- **Take it to your projects:** size warehouses per workload, keep auto-suspend short, and add cost guardrails (resource monitor for warehouses, budget for total spend including serverless and AI) before the first production load.
+
 ## Step 2: Resilient Ingestion (~15 min)
 
 ### 2.1 Stage and file format
@@ -435,7 +441,16 @@ COMMENT = 'Sell-out landing table (bronze). Schema evolves with incoming files.'
 
 ### 2.4 Dry run before loading
 
-`VALIDATION_MODE = RETURN_ERRORS` parses files and returns errors without writing anything. However, it **cannot be combined with `MATCH_BY_COLUMN_NAME`** (Snowflake treats column matching as a transform). So we use a two-part pre-flight: (1) `VALIDATION_MODE` into a single-VARIANT table to catch malformed JSON, and (2) a typed check directly on the staged files with `TRY_TO_NUMBER`/`TRY_TO_DATE`.
+**Why a dry run?** Batch 3 is the "bad" delivery from the source system: it brings a new column and some broken values. Before loading it, we want to know **what will go wrong, where, and how much**, so we can decide whether to load it (and accept the rejects) or send it back to the source. Nothing is written to the landing table in this step.
+
+A JSON file can fail in two different ways, and each needs its own check:
+
+| Problem | Example | What happens at load time | Checked by |
+| --- | --- | --- | --- |
+| The file cannot be read | broken JSON (missing brace, truncated file) | the record or file is rejected | query (1) |
+| The file is readable, but a value does not fit the column type | `"UNITS": "N/A"` going into a `NUMBER` column | that **row** is rejected | query (2) |
+
+`VALIDATION_MODE = RETURN_ERRORS` is Snowflake's built-in dry run: it reads the files and returns the errors without loading anything. Here it only covers the first problem, for two reasons: it **cannot be combined with `MATCH_BY_COLUMN_NAME`** (which our real load needs for schema evolution), and it loads into a single `VARIANT` column, where any valid JSON fits, so it never sees a type error. Query (2) covers the second problem by simulating the cast ourselves.
 
 ```sql
 -- (1) Parse-level validation: is every record valid JSON? (expect 0 errors)
@@ -454,7 +469,9 @@ WHERE TRY_TO_NUMBER($1:UNITS::VARCHAR) IS NULL
    OR TRY_TO_DATE($1:SALE_DATE::VARCHAR) IS NULL;
 ```
 
-> The first query returns no rows (the JSON is well-formed); the second returns the ~20 records with `UNITS = 'N/A'`, with file name and row number. For CSV loads without column matching, `VALIDATION_MODE` alone reports type errors too.
+> **Reading the results.** Query (1) returns no rows: the JSON is well-formed. Query (2) returns about 20 **rows** (not whole files), each pointing to its file and row number, all with `UNITS = 'N/A'`. These are exactly the rows the real load will reject in step 2.6 (`errors_seen = 20`) and that we will move to quarantine in step 2.7. The other ~29,980 rows of the batch are fine, so the decision here is: load the batch with `ON_ERROR = CONTINUE` and handle the 20 rejects, instead of blocking the whole delivery.
+>
+> For CSV loads without column matching, `VALIDATION_MODE` alone also reports type errors, so query (2) is not needed.
 
 ### 2.5 Load batches 1 and 2
 
@@ -496,13 +513,7 @@ SELECT PROMO_FLAG, COUNT(*) FROM RAW.SELL_OUT_LANDING GROUP BY 1;
 
 The COPY output of batch\_3 already reports `PARTIALLY_LOADED`, `rows_loaded = 29,980`, `errors_seen = 20` and the first error (*Failed to cast variant value "N/A" to FIXED*, line 1500).
 
-`VALIDATE(<table>, JOB_ID => '_last')` returns every rejected row of a previous COPY — but only for COPY **without transforms**. Because this load uses `MATCH_BY_COLUMN_NAME` (required for schema evolution), Snowflake answers: *VALIDATE and VALIDATE\_PIPE\_LOAD do not support COPY with transform*. Try it:
-
-```sql
--- Expected error here: "VALIDATE ... do not support COPY with transform"
-SELECT ERROR, FILE, LINE, COLUMN_NAME, REJECTED_RECORD
-FROM TABLE(VALIDATE(RAW.SELL_OUT_LANDING, JOB_ID => '_last'));
-```
+`VALIDATE(<table>, JOB_ID => '_last')` is the usual way to list the rejected rows of a previous COPY, but it only works for COPY **without transforms**. Our load uses `MATCH_BY_COLUMN_NAME` (required for schema evolution), which Snowflake treats as a transform, so `VALIDATE()` cannot be used here.
 
 The production pattern for column-matched loads is a **quarantine table** built from the staged files with the same rules the typed table enforces:
 
@@ -586,9 +597,37 @@ SELECT
 
 ---
 
+### Recap: what you built in Step 2
+
+- **You built:** stage `RAW.INGEST_STAGE` and format `RAW.FF_JSON`; the typed landing table `RAW.SELL_OUT_LANDING` with schema evolution and audit columns; the quarantine table `RAW.SELL_OUT_REJECTS`; and the RAW dimensions plus `RAW.PRODUCT_PRICE_EVENTS`.
+- **What the pipeline now survives:** a new column at the source (`PROMO_FLAG` added automatically), bad values (20 rows rejected and kept in quarantine instead of lost), and the same files arriving twice (reload is a no-op).
+- **The checks you used:** dry run before loading (step 2.4), the COPY result and quarantine (2.7), `COPY_HISTORY` / `LOAD_HISTORY` for auditing (2.9).
+- **Take it to your projects:** this is the template for any file-based source: typed landing table + `MATCH_BY_COLUMN_NAME` + `ON_ERROR = CONTINUE` + quarantine table + an alert when the quarantine is not empty.
+
 ## Step 3: CDC with Streams + Tasks (~15 min)
 
+**What this step does, in one sentence:** every 5 minutes, a small pipeline copies **only the new or changed rows** from the landing table `RAW.SELL_OUT_LANDING` into a clean SILVER table, without duplicates and without reprocessing what was already done.
+
+```text
+ RAW.SELL_OUT_LANDING ──► SELL_OUT_LANDING_STREAM ──► T_MERGE_SELL_OUT (MERGE) ──► SILVER.SELL_OUT_TASKS
+   (landing table)         "what changed since          runs only if the             (clean, one row
+                            the last run?"              stream has data              per SALE_ID)
+
+ T_ROOT (every 5 min) ──► T_MERGE_SELL_OUT ──► T_FINALIZER ──► RAW.PIPELINE_RUN_LOG
+   the clock                 the work            always runs        one line per run
+```
+
 ### 3.1 Concepts
+
+| Piece | Object in this lab | What it does | Think of it as |
+| --- | --- | --- | --- |
+| Stream | `RAW.SELL_OUT_LANDING_STREAM` | Returns only the rows inserted, updated or deleted in the landing table since the last time it was consumed. | A bookmark: it remembers where you stopped reading. |
+| Root task | `RAW.T_ROOT` | Holds the schedule (every 5 minutes) and starts the graph. It does no real work. | The clock. |
+| Child task | `RAW.T_MERGE_SELL_OUT` | Reads the stream and MERGEs the changes into SILVER. Skipped (no cost) when the stream is empty. | The worker. |
+| Finalizer | `RAW.T_FINALIZER` | Runs at the end of every graph run, success or failure, and writes a log line. | The person who closes the shop and fills in the logbook. |
+| Target table | `SILVER.SELL_OUT_TASKS` | The clean result: one row per `SALE_ID`. | The shelf where the finished goods go. |
+
+The details behind each piece:
 
 - **Stream** — a change-tracking offset on a table. Querying it returns the rows changed since the last *consumed* offset, with `METADATA$ACTION`, `METADATA$ISUPDATE` and `METADATA$ROW_ID`. The offset only advances when the stream is read inside a **committed DML** transaction — this gives **exactly-once** processing: if the MERGE fails, the offset does not move and the changes are reprocessed next run.
 - **Task** — scheduled SQL. Omitting `WAREHOUSE` makes it **serverless**: Snowflake sizes compute automatically and bills per second of actual use.
@@ -635,6 +674,8 @@ SELECT METADATA$ACTION, COUNT(*) FROM RAW.SELL_OUT_LANDING_STREAM GROUP BY 1;  -
 ```
 
 ### 3.3 Build the task DAG
+
+**Order of execution in each run:** `T_ROOT` starts → `T_MERGE_SELL_OUT` runs only if the stream has data → `T_FINALIZER` always runs last. The three `CREATE TASK` statements below build exactly this graph: `AFTER RAW.T_ROOT` makes the merge a child of the root, and `FINALIZE = RAW.T_ROOT` makes the finalizer the last step.
 
 The MERGE keeps only `INSERT` actions (an UPDATE in the source appears as a DELETE + INSERT pair with `METADATA$ISUPDATE = TRUE`), and dedups by `SALE_ID` with `QUALIFY` so a re-sent record never creates duplicates.
 
@@ -722,9 +763,18 @@ SELECT * FROM RAW.PIPELINE_RUN_LOG ORDER BY FINISHED_AT DESC;
 SELECT COUNT(*) AS PENDING FROM RAW.SELL_OUT_LANDING_STREAM;   -- 0: the stream offset advanced
 ```
 
+**What you should see after the first run:** `T_ROOT`, `T_MERGE_SELL_OUT` and `T_FINALIZER` with `STATE = SUCCEEDED`; `SILVER_ROWS` equal to the number of distinct `SALE_ID`s in the landing table; one line in `PIPELINE_RUN_LOG`; and `PENDING = 0` in the stream, because the bookmark moved forward.
+
 ### 3.6 Late data, corrections and exactly-once
 
 Now simulate the real world: 5 late sales arrive, one existing sale is corrected, and one record is re-sent twice. Only the delta is processed.
+
+| Event (simulated below) | What lands in RAW | What the stream shows | Result in SILVER |
+| --- | --- | --- | --- |
+| 5 late sales arrive | 5 new rows (`S9000001`…`S9000005`) | 5 `INSERT` rows | 5 new rows |
+| An existing sale is corrected | `S0000001` updated to `UNITS = 999` | a `DELETE` + `INSERT` pair with `METADATA$ISUPDATE = TRUE` | the same row updated in place (`UNITS = 999`) |
+| A late sale is re-sent | a 2nd copy of `S9000001` | 1 more `INSERT` row | no new row: the MERGE dedups by `SALE_ID` |
+| The 150k historical rows | unchanged | nothing | not reprocessed |
 
 ```sql
 -- 5 late sales (new SALE_IDs)
@@ -782,6 +832,12 @@ SHOW TASKS IN SCHEMA RAW;   -- state = suspended for all three
 ```
 
 ---
+
+### Recap: what you built in Step 3
+
+- **You built:** the stream `RAW.SELL_OUT_LANDING_STREAM`, the target `SILVER.SELL_OUT_TASKS`, the run log `RAW.PIPELINE_RUN_LOG`, and a task DAG: `T_ROOT` → `T_MERGE_SELL_OUT` → `T_FINALIZER`.
+- **Key idea:** the stream records only what changed since the last read, and it advances only when the transaction commits, so a failed run reprocesses nothing twice and loses nothing.
+- **Take it to your projects:** use Streams + Tasks when you need procedural control: merges with custom rules, calls to other systems, logging, and a finalizer that always runs. Remember to suspend tasks you are not using.
 
 ## Step 4: Declarative Pipelines with Dynamic Tables (~20 min)
 
@@ -1095,6 +1151,13 @@ LIMIT 10;
 
 ---
 
+### Recap: what you built in Step 4
+
+- **You built:** the Dynamic Tables `SILVER.DT_SELL_OUT_CLEAN` (incremental, deduplicated), `SILVER.DT_PRODUCT_PRICE_SCD2` (price history), `GOLD.DT_MARKET_SHARE_MONTHLY` and `GOLD.DT_PHARMACY_PERFORMANCE`, plus the custom `SILVER.DT_SELL_OUT_CDC_CUSTOM` with `REFRESH USING`.
+- **The complete data flow:** files → `RAW.SELL_OUT_LANDING` → (stream + tasks **or** Dynamic Tables) → SILVER → GOLD. You proved it: a new row in RAW reached GOLD with nothing run by hand.
+- **Choosing the approach:** Dynamic Tables when the result is a SQL-defined table; Streams + Tasks for procedural logic and side effects; `REFRESH USING` for custom incremental logic inside a Dynamic Table.
+- **Take it to your projects:** start declarative (Dynamic Tables) and drop to Streams + Tasks only where you need the extra control.
+
 ## Step 5: Dev Lifecycle: Clone, Swap, Undrop (Optional)
 
 > **Optional — skip during the SnowDay session.**  Nothing later in the lab depends on this step. Come back to it after the event.
@@ -1210,6 +1273,12 @@ SELECT (SELECT COUNT(*) FROM CLOSEUP_HOL2.RAW.LABORATORIES WHERE SEGMENT IS NOT 
        (SELECT COUNT(*) FROM CLOSEUP_HOL2.RAW.FIELD_NOTES)                            AS FIELD_NOTES_ROWS,
        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.DATABASES WHERE DATABASE_NAME = 'CLOSEUP_HOL2_DEV') AS DEV_DB_EXISTS;
 ```
+
+### Recap: what you built in Step 5
+
+- **You built:** the development database `CLOSEUP_HOL2_DEV` as a zero-copy clone, promoted a change with an atomic `SWAP`, recovered a dropped table with `UNDROP`, and restored a table to its state before a bad statement with Time Travel.
+- **Key idea:** clones cost no extra storage until data changes, so a full dev or test copy of production takes seconds.
+- **Take it to your projects:** clone production for every release test, and keep Time Travel retention long enough to recover from mistakes.
 
 ## Challenge Block 2 — Security & roles (25 min · step 6)
 
@@ -1573,6 +1642,13 @@ SHOW GRANTS TO ROLE AGENT_USER_ROLE;
 SELECT CURRENT_ROLE();   -- back to ACCOUNTADMIN for the next steps
 ```
 
+### Recap: what you built in Step 6
+
+- **You built:** the functional roles `HOL_ENGINEER`, `HOL_ANALYST` and `AGENT_USER_ROLE` under `SYSADMIN`; the access roles `DR_GOLD_READ` and `DR_SILVER_RW` as database roles with future grants; the masking policy `GOVERNANCE.MP_PERSON_NAME` on doctor names; the row access policy `GOVERNANCE.RAP_COUNTRY` with `SEMANTIC.ROLE_COUNTRY_MAP`; and the Standard Edition alternative `GOLD.V_MARKET_SHARE_SECURE`.
+- **The model:** users get functional roles; functional roles get access roles; access roles hold the privileges on objects. Future grants cover tables that do not exist yet.
+- **You reproduced and fixed** the three classic privilege errors and used the diagnosis toolkit (`SHOW GRANTS`, current and secondary roles).
+- **Take it to your projects:** never grant privileges directly to people-facing roles, always create objects with the owning role, and put masking and row access policies on the data so they apply to BI, APIs and agents alike.
+
 ## Challenge Block 3 — AI (30 min · steps 7–8)
 
 **Mission:** Expose the GOLD layer to business users: semantic view, search service and a Cortex Agent with a dedicated role, all in SQL.
@@ -1807,6 +1883,12 @@ USE ROLE ACCOUNTADMIN;
 
 ---
 
+### Recap: what you built in Step 7
+
+- **You built:** the semantic view `SEMANTIC.SV_PHARMA_MARKET` in SQL, queried it with `SEMANTIC_VIEW()`, and granted it to the consumer roles.
+- **Key idea:** one governed definition of the business metrics, shared by the agent and by SQL or BI consumers. Without a grant on the semantic view, a role cannot ask the agent about it.
+- **Take it to your projects:** keep the semantic view in version control next to your pipeline code and review metric changes like code changes.
+
 ## Step 8: Cortex Search + Cortex Agent via SQL (~20 min)
 
 ### 8.1 Enrich field notes with AI functions
@@ -2006,6 +2088,13 @@ SHOW CORTEX SEARCH SERVICES IN SCHEMA CLOSEUP_HOL2.SEMANTIC;
 SHOW GRANTS ON AGENT CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;
 ```
 
+### Recap: what you built in Step 8
+
+- **You built:** `SEMANTIC.FIELD_NOTES_ENRICHED` (AI functions), the Cortex Search service `SEMANTIC.CS_FIELD_NOTES`, and the agent `APPS.PHARMA_MARKET_AGENT` defined from a YAML specification, granted to `AGENT_USER_ROLE` and smoke-tested with that role.
+- **The flow so far:** GOLD tables → semantic view + search service → agent, all protected by the roles and policies from step 6.
+- **Key idea:** the agent is code: instructions, tools and model live in a specification you can version and promote from dev to production.
+- **Take it to your projects:** always test the agent with the end-user role, not `ACCOUNTADMIN`; if it works as admin and fails as the user, the problem is a grant.
+
 ## Block 4 — Integrations (15 min · steps 9–10 · instructor demo)
 
 The instructor shows how applications consume the platform: the SQL API and the Cortex Agents REST API with a role-restricted PAT,
@@ -2193,6 +2282,12 @@ SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER HOL2_API_USER;
 
 ---
 
+### Recap: what you built in Step 9
+
+- **You built:** the service user `HOL2_API_USER` with `AGENT_USER_ROLE`, a programmatic access token (PAT), and the network rule and policy that restrict where the token can be used from. Then you called the SQL API and the Cortex Agents REST API, including the streaming (SSE) response.
+- **Key idea:** any back end that speaks HTTP can query data or ask the agent, with the same role-based security as a user in Snowsight.
+- **Take it to your projects:** use a dedicated service user and role per integration, a PAT with a network policy, and never embed user passwords in code.
+
 ## Step 10: React App on Snowflake App Runtime (~8 min · Instructor demo)
 
 > **Instructor demo.**  During the session the instructor runs this step live on screen.
@@ -2313,6 +2408,12 @@ SHOW GRANTS ON AGENT CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;
 ```
 
 ---
+
+### Recap: what you built in Step 10
+
+- **You built:** a React app deployed on Snowflake App Runtime that talks to the agent, with access granted through `AGENT_USER_ROLE`.
+- **The complete platform:** files → RAW → SILVER → GOLD → semantic view + search → agent → REST API → React app, with security and cost controls at every layer, without the data leaving Snowflake.
+- **Take it to your projects:** the code is on GitHub. Use it as a starting point for internal apps on top of your own agents.
 
 ## Step 11: Cleanup (After the event)
 

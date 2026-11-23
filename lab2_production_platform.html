@@ -433,6 +433,7 @@ SELECT 'FIELD_NOTES',   COUNT(*) FROM SOURCE_SYSTEM.FIELD_NOTES;</code></pre>
 </div>
 <p>Expected: 15 / 80 / 400 / 600 / 150,000 / 60,000 / 300 rows.</p>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 1</strong><ul><li><strong>You built:</strong> warehouse <code>CLOSEUP_HOL2_WH</code>, database <code>CLOSEUP_HOL2</code> with the layers <code>SOURCE_SYSTEM</code>, <code>RAW</code> (bronze), <code>SILVER</code>, <code>GOLD</code>, <code>SEMANTIC</code> and <code>APPS</code>, and the 7-table simulated source system. Optionally, the resource monitor <code>CLOSEUP_HOL2_RM</code> and the budget <code>CLOSEUP_HOL2_BUDGET</code>.</li><li><strong>You saw:</strong> scaling the warehouse up and down in seconds, and the result cache returning a repeated query with no compute.</li><li><strong>Take it to your projects:</strong> size warehouses per workload, keep auto-suspend short, and add cost guardrails (resource monitor for warehouses, budget for total spend including serverless and AI) before the first production load.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-2">
 <div class="step-header" onclick="toggleStep(2)">
@@ -531,7 +532,10 @@ COMMENT = 'Sell-out landing table (bronze). Schema evolves with incoming files.'
 <div class="info-box warning"><strong>Schema evolution requirements.</strong> (1) The table must have <code>ENABLE_SCHEMA_EVOLUTION = TRUE</code>; (2) the <code>COPY</code> must use <code>MATCH_BY_COLUMN_NAME</code>; (3) the role running the COPY must <strong>own the table</strong> (or have EVOLVE SCHEMA + ALTER privileges). With ON_ERROR=CONTINUE, a file can add at most 10 columns per COPY.</div>
 
 <h3>2.4 Dry run before loading</h3>
-<p><code>VALIDATION_MODE = RETURN_ERRORS</code> parses files and returns errors without writing anything. However, it <strong>cannot be combined with <code>MATCH_BY_COLUMN_NAME</code></strong> (Snowflake treats column matching as a transform). So we use a two-part pre-flight: (1) <code>VALIDATION_MODE</code> into a single-VARIANT table to catch malformed JSON, and (2) a typed check directly on the staged files with <code>TRY_TO_NUMBER</code>/<code>TRY_TO_DATE</code>.</p>
+<p><strong>Why a dry run?</strong> Batch 3 is the "bad" delivery from the source system: it brings a new column and some broken values. Before loading it, we want to know <strong>what will go wrong, where, and how much</strong>, so we can decide whether to load it (and accept the rejects) or send it back to the source. Nothing is written to the landing table in this step.</p>
+<p>A JSON file can fail in two different ways, and each needs its own check:</p>
+<table><tr><th>Problem</th><th>Example</th><th>What happens at load time</th><th>Checked by</th></tr><tr><td>The file cannot be read</td><td>broken JSON (missing brace, truncated file)</td><td>the record or file is rejected</td><td>query (1)</td></tr><tr><td>The file is readable, but a value does not fit the column type</td><td><code>"UNITS": "N/A"</code> going into a <code>NUMBER</code> column</td><td>that <strong>row</strong> is rejected</td><td>query (2)</td></tr></table>
+<p><code>VALIDATION_MODE = RETURN_ERRORS</code> is Snowflake's built-in dry run: it reads the files and returns the errors without loading anything. Here it only covers the first problem, for two reasons: it <strong>cannot be combined with <code>MATCH_BY_COLUMN_NAME</code></strong> (which our real load needs for schema evolution), and it loads into a single <code>VARIANT</code> column, where any valid JSON fits, so it never sees a type error. Query (2) covers the second problem by simulating the cast ourselves.</p>
 <div class="code-block" data-language="sql">
   <div class="code-header">
     <span class="code-language">SQL</span>
@@ -552,7 +556,7 @@ FROM @RAW.INGEST_STAGE/sell_out/batch_3/ (FILE_FORMAT =&gt; 'RAW.FF_JSON')
 WHERE TRY_TO_NUMBER($1:UNITS::VARCHAR) IS NULL
    OR TRY_TO_DATE($1:SALE_DATE::VARCHAR) IS NULL;</code></pre>
 </div>
-<div class="info-box note">The first query returns no rows (the JSON is well-formed); the second returns the ~20 records with <code>UNITS = 'N/A'</code>, with file name and row number. For CSV loads without column matching, <code>VALIDATION_MODE</code> alone reports type errors too.</div>
+<div class="info-box note"><strong>Reading the results.</strong> Query (1) returns no rows: the JSON is well-formed. Query (2) returns about 20 <strong>rows</strong> (not whole files), each pointing to its file and row number, all with <code>UNITS = 'N/A'</code>. These are exactly the rows the real load will reject in step 2.6 (<code>errors_seen = 20</code>) and that we will move to quarantine in step 2.7. The other ~29,980 rows of the batch are fine, so the decision here is: load the batch with <code>ON_ERROR = CONTINUE</code> and handle the 20 rejects, instead of blocking the whole delivery.<br><br>For CSV loads without column matching, <code>VALIDATION_MODE</code> alone also reports type errors, so query (2) is not needed.</div>
 
 <h3>2.5 Load batches 1 and 2</h3>
 <div class="code-block" data-language="sql">
@@ -598,16 +602,7 @@ SELECT PROMO_FLAG, COUNT(*) FROM RAW.SELL_OUT_LANDING GROUP BY 1;</code></pre>
 
 <h3>2.7 Rejected rows: COPY result, VALIDATE() and a quarantine table</h3>
 <p>The COPY output of batch_3 already reports <code>PARTIALLY_LOADED</code>, <code>rows_loaded = 29,980</code>, <code>errors_seen = 20</code> and the first error (<em>Failed to cast variant value "N/A" to FIXED</em>, line 1500).</p>
-<p><code>VALIDATE(&lt;table&gt;, JOB_ID =&gt; '_last')</code> returns every rejected row of a previous COPY — but only for COPY <strong>without transforms</strong>. Because this load uses <code>MATCH_BY_COLUMN_NAME</code> (required for schema evolution), Snowflake answers: <em>VALIDATE and VALIDATE_PIPE_LOAD do not support COPY with transform</em>. Try it:</p>
-<div class="code-block" data-language="sql">
-  <div class="code-header">
-    <span class="code-language">SQL</span>
-    <div class="code-actions"><button class="btn-copy" onclick="copyCode(this)">Copy</button></div>
-  </div>
-  <pre><code class="language-sql">-- Expected error here: "VALIDATE ... do not support COPY with transform"
-SELECT ERROR, FILE, LINE, COLUMN_NAME, REJECTED_RECORD
-FROM TABLE(VALIDATE(RAW.SELL_OUT_LANDING, JOB_ID =&gt; '_last'));</code></pre>
-</div>
+<p><code>VALIDATE(&lt;table&gt;, JOB_ID =&gt; '_last')</code> is the usual way to list the rejected rows of a previous COPY, but it only works for COPY <strong>without transforms</strong>. Our load uses <code>MATCH_BY_COLUMN_NAME</code> (required for schema evolution), which Snowflake treats as a transform, so <code>VALIDATE()</code> cannot be used here.</p>
 <p>The production pattern for column-matched loads is a <strong>quarantine table</strong> built from the staged files with the same rules the typed table enforces:</p>
 <div class="code-block" data-language="sql">
   <div class="code-header">
@@ -698,6 +693,7 @@ CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) e;</code></pre>
   (SELECT COUNT(DISTINCT SOURCE_FILE) FROM RAW.SELL_OUT_LANDING)            AS FILES_LOADED;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 2</strong><ul><li><strong>You built:</strong> stage <code>RAW.INGEST_STAGE</code> and format <code>RAW.FF_JSON</code>; the typed landing table <code>RAW.SELL_OUT_LANDING</code> with schema evolution and audit columns; the quarantine table <code>RAW.SELL_OUT_REJECTS</code>; and the RAW dimensions plus <code>RAW.PRODUCT_PRICE_EVENTS</code>.</li><li><strong>What the pipeline now survives:</strong> a new column at the source (<code>PROMO_FLAG</code> added automatically), bad values (20 rows rejected and kept in quarantine instead of lost), and the same files arriving twice (reload is a no-op).</li><li><strong>The checks you used:</strong> dry run before loading (step 2.4), the COPY result and quarantine (2.7), <code>COPY_HISTORY</code> / <code>LOAD_HISTORY</code> for auditing (2.9).</li><li><strong>Take it to your projects:</strong> this is the template for any file-based source: typed landing table + <code>MATCH_BY_COLUMN_NAME</code> + <code>ON_ERROR = CONTINUE</code> + quarantine table + an alert when the quarantine is not empty.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-3">
 <div class="step-header" onclick="toggleStep(3)">
@@ -705,7 +701,13 @@ CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) e;</code></pre>
 <label class="step-check" onclick="event.stopPropagation()"><input type="checkbox" id="check-3" onchange="markStepComplete(3)"> Done</label>
 <span class="step-toggle">&#9662;</span></div>
 <div class="step-content">
+<p><strong>What this step does, in one sentence:</strong> every 5 minutes, a small pipeline copies <strong>only the new or changed rows</strong> from the landing table <code>RAW.SELL_OUT_LANDING</code> into a clean SILVER table, without duplicates and without reprocessing what was already done.</p>
+<div style="margin:16px 0;padding:14px;background:#f4f8fb;border-radius:10px;display:flex;flex-wrap:wrap;align-items:center;gap:6px"><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#11567F;color:#fff"><strong>SELL_OUT_LANDING</strong><br><span style="font-size:.75rem">RAW · landing table</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#29B5E8;color:#fff"><strong>STREAM</strong><br><span style="font-size:.75rem">what changed since the last run?</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#7D44CF;color:#fff"><strong>T_MERGE_SELL_OUT</strong><br><span style="font-size:.75rem">MERGE only the delta</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#11567F;color:#fff"><strong>SELL_OUT_TASKS</strong><br><span style="font-size:.75rem">SILVER · one clean row per SALE_ID</span></div></div>
+<div style="margin:16px 0;padding:14px;background:#f4f8fb;border-radius:10px;display:flex;flex-wrap:wrap;align-items:center;gap:6px"><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#8A999E;color:#fff"><strong>T_ROOT</strong><br><span style="font-size:.75rem">the clock: every 5 min</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#7D44CF;color:#fff"><strong>T_MERGE_SELL_OUT</strong><br><span style="font-size:.75rem">runs only if the stream has data</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#FF9F36;color:#000"><strong>T_FINALIZER</strong><br><span style="font-size:.75rem">always runs, even on failure</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#8A999E;color:#fff"><strong>PIPELINE_RUN_LOG</strong><br><span style="font-size:.75rem">one line per run</span></div></div>
 <h3>3.1 Concepts</h3>
+<table><tr><th style="width:34%">Piece</th><th>What it does</th><th>Think of it as</th></tr><tr><td><strong>Stream</strong><br><span style="font-size:.72rem;white-space:nowrap"><code>RAW.SELL_OUT_LANDING_STREAM</code></span></td><td>Returns only the rows inserted, updated or deleted in the landing table since the last time it was consumed.</td><td>A bookmark: it remembers where you stopped reading.</td></tr><tr><td><strong>Root task</strong><br><span style="font-size:.72rem;white-space:nowrap"><code>RAW.T_ROOT</code></span></td><td>Holds the schedule (every 5 minutes) and starts the graph. It does no real work.</td><td>The clock.</td></tr><tr><td><strong>Child task</strong><br><span style="font-size:.72rem;white-space:nowrap"><code>RAW.T_MERGE_SELL_OUT</code></span></td><td>Reads the stream and MERGEs the changes into SILVER. Skipped (no cost) when the stream is empty.</td><td>The worker.</td></tr><tr><td><strong>Finalizer</strong><br><span style="font-size:.72rem;white-space:nowrap"><code>RAW.T_FINALIZER</code></span></td><td>Runs at the end of every graph run, success or failure, and writes a log line.</td><td>The person who closes the shop and fills in the logbook.</td></tr><tr><td><strong>Target table</strong><br><span style="font-size:.72rem;white-space:nowrap"><code>SILVER.SELL_OUT_TASKS</code></span></td><td>The clean result: one row per <code>SALE_ID</code>.</td><td>The shelf where the finished goods go.</td></tr></table>
+<p>The details behind each piece:</p>
+
 <ul>
 <li><strong>Stream</strong> — a change-tracking offset on a table. Querying it returns the rows changed since the last <em>consumed</em> offset, with <code>METADATA$ACTION</code>, <code>METADATA$ISUPDATE</code> and <code>METADATA$ROW_ID</code>. The offset only advances when the stream is read inside a <strong>committed DML</strong> transaction — this gives <strong>exactly-once</strong> processing: if the MERGE fails, the offset does not move and the changes are reprocessed next run.</li>
 <li><strong>Task</strong> — scheduled SQL. Omitting <code>WAREHOUSE</code> makes it <strong>serverless</strong>: Snowflake sizes compute automatically and bills per second of actual use.</li>
@@ -755,6 +757,9 @@ SELECT METADATA$ACTION, COUNT(*) FROM RAW.SELL_OUT_LANDING_STREAM GROUP BY 1;  -
 </div>
 
 <h3>3.3 Build the task DAG</h3>
+<p><strong>Order of execution in each run:</strong> <code>T_ROOT</code> starts → <code>T_MERGE_SELL_OUT</code> runs only if the stream has data → <code>T_FINALIZER</code> always runs last. The three <code>CREATE TASK</code> statements below build exactly this graph: <code>AFTER RAW.T_ROOT</code> makes the merge a child of the root, and <code>FINALIZE = RAW.T_ROOT</code> makes the finalizer the last step.</p>
+<div style="margin:16px 0;padding:14px;background:#f4f8fb;border-radius:10px;display:flex;flex-wrap:wrap;align-items:center;gap:6px"><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#8A999E;color:#fff"><strong>T_ROOT</strong><br><span style="font-size:.75rem">the clock: every 5 min</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#7D44CF;color:#fff"><strong>T_MERGE_SELL_OUT</strong><br><span style="font-size:.75rem">runs only if the stream has data</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#FF9F36;color:#000"><strong>T_FINALIZER</strong><br><span style="font-size:.75rem">always runs, even on failure</span></div><span style="font-size:1.3rem;color:var(--sf-dark)">&rarr;</span><div style="flex:1 1 150px;max-width:210px;padding:10px 12px;border-radius:8px;font-family:Montserrat,sans-serif;font-size:.8rem;text-align:center;overflow-wrap:anywhere;background:#8A999E;color:#fff"><strong>PIPELINE_RUN_LOG</strong><br><span style="font-size:.75rem">one line per run</span></div></div>
+
 <p>The MERGE keeps only <code>INSERT</code> actions (an UPDATE in the source appears as a DELETE + INSERT pair with <code>METADATA$ISUPDATE = TRUE</code>), and dedups by <code>SALE_ID</code> with <code>QUALIFY</code> so a re-sent record never creates duplicates.</p>
 <div class="code-block" data-language="sql">
   <div class="code-header">
@@ -848,8 +853,10 @@ SELECT * FROM RAW.PIPELINE_RUN_LOG ORDER BY FINISHED_AT DESC;
 SELECT COUNT(*) AS PENDING FROM RAW.SELL_OUT_LANDING_STREAM;   -- 0: the stream offset advanced</code></pre>
 </div>
 
+<div class="info-box tip"><strong>What you should see after the first run:</strong> <code>T_ROOT</code>, <code>T_MERGE_SELL_OUT</code> and <code>T_FINALIZER</code> with <code>STATE = SUCCEEDED</code>; <code>SILVER_ROWS</code> equal to the number of distinct <code>SALE_ID</code>s in the landing table; one line in <code>PIPELINE_RUN_LOG</code>; and <code>PENDING = 0</code> in the stream, because the bookmark moved forward.</div>
 <h3>3.6 Late data, corrections and exactly-once</h3>
 <p>Now simulate the real world: 5 late sales arrive, one existing sale is corrected, and one record is re-sent twice. Only the delta is processed.</p>
+<table><tr><th>Event (simulated below)</th><th>What lands in RAW</th><th>What the stream shows</th><th>Result in SILVER</th></tr><tr><td>5 late sales arrive</td><td>5 new rows (<code>S9000001</code>…<code>S9000005</code>)</td><td>5 <code>INSERT</code> rows</td><td>5 new rows</td></tr><tr><td>An existing sale is corrected</td><td><code>S0000001</code> updated to <code>UNITS = 999</code></td><td>a <code>DELETE</code> + <code>INSERT</code> pair with <code>METADATA$ISUPDATE = TRUE</code></td><td>the same row updated in place (<code>UNITS = 999</code>)</td></tr><tr><td>A late sale is re-sent</td><td>a 2nd copy of <code>S9000001</code></td><td>1 more <code>INSERT</code> row</td><td>no new row: the MERGE dedups by <code>SALE_ID</code></td></tr><tr><td>The 150k historical rows</td><td>unchanged</td><td>nothing</td><td>not reprocessed</td></tr></table>
 <div class="code-block" data-language="sql">
   <div class="code-header">
     <span class="code-language">SQL</span>
@@ -913,6 +920,7 @@ ALTER TASK RAW.T_FINALIZER SUSPEND;
 SHOW TASKS IN SCHEMA RAW;   -- state = suspended for all three</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 3</strong><ul><li><strong>You built:</strong> the stream <code>RAW.SELL_OUT_LANDING_STREAM</code>, the target <code>SILVER.SELL_OUT_TASKS</code>, the run log <code>RAW.PIPELINE_RUN_LOG</code>, and a task DAG: <code>T_ROOT</code> → <code>T_MERGE_SELL_OUT</code> → <code>T_FINALIZER</code>.</li><li><strong>Key idea:</strong> the stream records only what changed since the last read, and it advances only when the transaction commits, so a failed run reprocesses nothing twice and loses nothing.</li><li><strong>Take it to your projects:</strong> use Streams + Tasks when you need procedural control: merges with custom rules, calls to other systems, logging, and a finalizer that always runs. Remember to suspend tasks you are not using.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-4">
 <div class="step-header" onclick="toggleStep(4)">
@@ -1280,6 +1288,7 @@ ORDER BY MONTH DESC, COUNTRY, THERAPEUTIC_AREA
 LIMIT 10;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 4</strong><ul><li><strong>You built:</strong> the Dynamic Tables <code>SILVER.DT_SELL_OUT_CLEAN</code> (incremental, deduplicated), <code>SILVER.DT_PRODUCT_PRICE_SCD2</code> (price history), <code>GOLD.DT_MARKET_SHARE_MONTHLY</code> and <code>GOLD.DT_PHARMACY_PERFORMANCE</code>, plus the custom <code>SILVER.DT_SELL_OUT_CDC_CUSTOM</code> with <code>REFRESH USING</code>.</li><li><strong>The complete data flow:</strong> files → <code>RAW.SELL_OUT_LANDING</code> → (stream + tasks <strong>or</strong> Dynamic Tables) → SILVER → GOLD. You proved it: a new row in RAW reached GOLD with nothing run by hand.</li><li><strong>Choosing the approach:</strong> Dynamic Tables when the result is a SQL-defined table; Streams + Tasks for procedural logic and side effects; <code>REFRESH USING</code> for custom incremental logic inside a Dynamic Table.</li><li><strong>Take it to your projects:</strong> start declarative (Dynamic Tables) and drop to Streams + Tasks only where you need the extra control.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-5">
 <div class="step-header" onclick="toggleStep(5)">
@@ -1432,6 +1441,7 @@ SELECT (SELECT COUNT(*) FROM CLOSEUP_HOL2.RAW.LABORATORIES WHERE SEGMENT IS NOT 
        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.DATABASES WHERE DATABASE_NAME = 'CLOSEUP_HOL2_DEV') AS DEV_DB_EXISTS;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 5</strong><ul><li><strong>You built:</strong> the development database <code>CLOSEUP_HOL2_DEV</code> as a zero-copy clone, promoted a change with an atomic <code>SWAP</code>, recovered a dropped table with <code>UNDROP</code>, and restored a table to its state before a bad statement with Time Travel.</li><li><strong>Key idea:</strong> clones cost no extra storage until data changes, so a full dev or test copy of production takes seconds.</li><li><strong>Take it to your projects:</strong> clone production for every release test, and keep Time Travel retention long enough to recover from mistakes.</li></ul></div>
 </div></section>
 <section class="card" id="block-2" style="border-left:6px solid #29B5E8">
 <h2>Challenge Block 2 &mdash; Security & roles <span style="font-size:.8em;color:#888">(25 min &middot; step 6)</span></h2>
@@ -1874,6 +1884,7 @@ SHOW GRANTS TO ROLE AGENT_USER_ROLE;
 SELECT CURRENT_ROLE();   -- back to ACCOUNTADMIN for the next steps</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 6</strong><ul><li><strong>You built:</strong> the functional roles <code>HOL_ENGINEER</code>, <code>HOL_ANALYST</code> and <code>AGENT_USER_ROLE</code> under <code>SYSADMIN</code>; the access roles <code>DR_GOLD_READ</code> and <code>DR_SILVER_RW</code> as database roles with future grants; the masking policy <code>GOVERNANCE.MP_PERSON_NAME</code> on doctor names; the row access policy <code>GOVERNANCE.RAP_COUNTRY</code> with <code>SEMANTIC.ROLE_COUNTRY_MAP</code>; and the Standard Edition alternative <code>GOLD.V_MARKET_SHARE_SECURE</code>.</li><li><strong>The model:</strong> users get functional roles; functional roles get access roles; access roles hold the privileges on objects. Future grants cover tables that do not exist yet.</li><li><strong>You reproduced and fixed</strong> the three classic privilege errors and used the diagnosis toolkit (<code>SHOW GRANTS</code>, current and secondary roles).</li><li><strong>Take it to your projects:</strong> never grant privileges directly to people-facing roles, always create objects with the owning role, and put masking and row access policies on the data so they apply to BI, APIs and agents alike.</li></ul></div>
 </div></section>
 <section class="card" id="block-3" style="border-left:6px solid #29B5E8">
 <h2>Challenge Block 3 &mdash; AI <span style="font-size:.8em;color:#888">(30 min &middot; steps 7–8)</span></h2>
@@ -2131,6 +2142,7 @@ ORDER BY total_market_sales_usd DESC;
 USE ROLE ACCOUNTADMIN;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 7</strong><ul><li><strong>You built:</strong> the semantic view <code>SEMANTIC.SV_PHARMA_MARKET</code> in SQL, queried it with <code>SEMANTIC_VIEW()</code>, and granted it to the consumer roles.</li><li><strong>Key idea:</strong> one governed definition of the business metrics, shared by the agent and by SQL or BI consumers. Without a grant on the semantic view, a role cannot ask the agent about it.</li><li><strong>Take it to your projects:</strong> keep the semantic view in version control next to your pipeline code and review metric changes like code changes.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-8">
 <div class="step-header" onclick="toggleStep(8)">
@@ -2358,6 +2370,7 @@ SHOW CORTEX SEARCH SERVICES IN SCHEMA CLOSEUP_HOL2.SEMANTIC;
 SHOW GRANTS ON AGENT CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 8</strong><ul><li><strong>You built:</strong> <code>SEMANTIC.FIELD_NOTES_ENRICHED</code> (AI functions), the Cortex Search service <code>SEMANTIC.CS_FIELD_NOTES</code>, and the agent <code>APPS.PHARMA_MARKET_AGENT</code> defined from a YAML specification, granted to <code>AGENT_USER_ROLE</code> and smoke-tested with that role.</li><li><strong>The flow so far:</strong> GOLD tables → semantic view + search service → agent, all protected by the roles and policies from step 6.</li><li><strong>Key idea:</strong> the agent is code: instructions, tools and model live in a specification you can version and promote from dev to production.</li><li><strong>Take it to your projects:</strong> always test the agent with the end-user role, not <code>ACCOUNTADMIN</code>; if it works as admin and fails as the user, the problem is a grant.</li></ul></div>
 </div></section>
 <section class="card" id="block-4" style="border-left:6px solid #11567F">
 <h2>Block 4 &mdash; Integrations <span style="font-size:.8em;color:#888">(15 min &middot; steps 9–10 &middot; instructor demo)</span></h2>
@@ -2575,6 +2588,7 @@ print()</code></pre>
     <pre><code class="language-sql">SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER HOL2_API_USER;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 9</strong><ul><li><strong>You built:</strong> the service user <code>HOL2_API_USER</code> with <code>AGENT_USER_ROLE</code>, a programmatic access token (PAT), and the network rule and policy that restrict where the token can be used from. Then you called the SQL API and the Cortex Agents REST API, including the streaming (SSE) response.</li><li><strong>Key idea:</strong> any back end that speaks HTTP can query data or ask the agent, with the same role-based security as a user in Snowsight.</li><li><strong>Take it to your projects:</strong> use a dedicated service user and role per integration, a PAT with a network policy, and never embed user passwords in code.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-10">
 <div class="step-header" onclick="toggleStep(10)">
@@ -2705,6 +2719,7 @@ npm run dev
 SHOW GRANTS ON AGENT CLOSEUP_HOL2.APPS.PHARMA_MARKET_AGENT;</code></pre>
 </div>
 
+<div class="info-box tip"><strong>Recap: what you built in Step 10</strong><ul><li><strong>You built:</strong> a React app deployed on Snowflake App Runtime that talks to the agent, with access granted through <code>AGENT_USER_ROLE</code>.</li><li><strong>The complete platform:</strong> files → RAW → SILVER → GOLD → semantic view + search → agent → REST API → React app, with security and cost controls at every layer, without the data leaving Snowflake.</li><li><strong>Take it to your projects:</strong> the code is on GitHub. Use it as a starting point for internal apps on top of your own agents.</li></ul></div>
 </div></section>
 <section class="step-card" id="step-11">
 <div class="step-header" onclick="toggleStep(11)">
