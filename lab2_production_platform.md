@@ -73,6 +73,12 @@ Internal Stages · COPY INTO · Schema Evolution · Streams · Tasks · Dynamic 
 
 ## Step 1: Setup & Environment (~10 min)
 
+**What this step does:** creates the platform skeleton (one schema per layer, from source to apps) and the 7-table source system you will ingest from.
+
+```text
+SOURCE_SYSTEM (simulated source) ──► RAW (bronze: as landed) ──► SILVER (clean, deduplicated) ──► GOLD (business aggregates) ──► SEMANTIC (semantic view, search) ──► APPS (agent and apps)
+```
+
 ### 1.1 Create the platform skeleton
 
 Every production platform starts with clear boundaries: one dedicated warehouse (compute) and one database with a schema per layer of the medallion architecture. `SOURCE_SYSTEM` simulates Close-Up's operational source, `RAW` is the landing zone, `SILVER`/`GOLD` hold curated data, `SEMANTIC` holds the business layer for AI, and `APPS` holds agents and applications.
@@ -353,6 +359,20 @@ Expected: 15 / 80 / 400 / 600 / 150,000 / 60,000 / 300 rows.
 - **Take it to your projects:** size warehouses per workload, keep auto-suspend short, and add cost guardrails (resource monitor for warehouses, budget for total spend including serverless and AI) before the first production load.
 
 ## Step 2: Resilient Ingestion (~15 min)
+
+**What this step does:** lands the sell-out JSON files with an ingestion that survives bad rows, new columns and repeated files, and keeps the rejected rows instead of losing them.
+
+```text
+JSON batches (batch_1 · batch_2 · batch_3) ──► INGEST_STAGE (files in Snowflake) ──► Dry run (2.4: what will fail?) ──► COPY INTO (MATCH_BY_COLUMN_NAME · ON_ERROR = CONTINUE) ──► SELL_OUT_LANDING (typed · schema evolution)
+Bad rows (UNITS = N/A) ──► SELL_OUT_REJECTS (quarantine, 2.7)
+```
+
+| Real-world problem | What handles it | Step |
+| --- | --- | --- |
+| A new column appears at the source | Schema evolution adds it (`PROMO_FLAG`) | 2.3, 2.6 |
+| Some values do not fit the type | Rows rejected, the rest loads; rejects go to quarantine | 2.6, 2.7 |
+| The same files arrive again | `COPY` skips files it already loaded | 2.8 |
+| "Did that file load?" | `COPY_HISTORY` / `LOAD_HISTORY` | 2.9 |
 
 ### 2.1 Stage and file format
 
@@ -841,6 +861,22 @@ SHOW TASKS IN SCHEMA RAW;   -- state = suspended for all three
 
 ## Step 4: Declarative Pipelines with Dynamic Tables (~20 min)
 
+**What this step does:** rebuilds the pipeline **declaratively**: you write the SELECT and the freshness you need, and Snowflake keeps each table up to date and processes only what changed.
+
+```text
+RAW.SELL_OUT_LANDING (landing) ──► SILVER.DT_SELL_OUT_CLEAN (incremental · lag DOWNSTREAM) ──► GOLD.DT_MARKET_SHARE_MONTHLY (adaptive · 1 hour)
+SILVER.DT_SELL_OUT_CLEAN ──► GOLD.DT_PHARMACY_PERFORMANCE (1 hour (+ RAW dimensions))
+RAW.PRODUCT_PRICE_EVENTS (price changes) ──► SILVER.DT_PRODUCT_PRICE_SCD2 (price history (SCD2))
+RAW.SELL_OUT_LANDING CHANGES (change feed) ──► SILVER.DT_SELL_OUT_CDC_CUSTOM (custom REFRESH USING)
+```
+
+|  | Streams + Tasks (Step 3) | Dynamic Tables (Step 4) |
+| --- | --- | --- |
+| You write | Stream, MERGE, task graph, log | One SELECT per table |
+| Who schedules | Your task schedule | Snowflake, to meet the target lag |
+| Incremental | You code it (stream + MERGE) | Automatic (or `REFRESH USING`) |
+| Best for | Procedural logic, side effects | SQL-defined tables and pipelines |
+
 In Step 3 you built CDC *imperatively*: a stream, a MERGE, a task DAG, a finalizer and a run log. It works, but you own every moving part. In this step you rebuild the same pipeline **declaratively** with **Dynamic Tables (DTs)**: you write a `SELECT`, declare how fresh the result must be (`TARGET_LAG`), and Snowflake handles change tracking, scheduling, dependency ordering, retries and incremental computation.
 
 ### 4.1 Pipeline design
@@ -1160,6 +1196,14 @@ LIMIT 10;
 
 ## Step 5: Dev Lifecycle: Clone, Swap, Undrop (Optional)
 
+**What this step does:** shows the development lifecycle without copying data: clone production into DEV, change it, swap it back, and recover from mistakes.
+
+```text
+CLOSEUP_HOL2 (production) ──► CLONE (zero-copy, seconds) ──► CLOSEUP_HOL2_DEV (develop & test) ──► SWAP (atomic promotion) ──► CLOSEUP_HOL2 (updated)
+DROP TABLE (oops) ──► UNDROP (back in seconds)
+Bad statement ──► Time Travel (clone BEFORE (STATEMENT => …)) ──► Restored table
+```
+
 > **Optional — skip during the SnowDay session.**  Nothing later in the lab depends on this step. Come back to it after the event.
 
 Production-grade means you can change things safely. Snowflake gives you three primitives that replace most "copy the database to test" workflows: **zero-copy cloning** (metadata-only copies, no storage duplicated until data diverges), **atomic SWAP** (promote a validated object in one metadata operation) and **Time Travel / UNDROP** (recover from mistakes).
@@ -1290,6 +1334,20 @@ SELECT (SELECT COUNT(*) FROM CLOSEUP_HOL2.RAW.LABORATORIES WHERE SEGMENT IS NOT 
 ---
 
 ## Step 6: Security & Roles (~25 min)
+
+**What this step does:** builds a role model you can copy to any project: people get **functional roles**, functional roles get **access roles**, and only access roles hold privileges on objects. Then it protects sensitive columns and rows with policies.
+
+```text
+Users ──► Functional roles (HOL_ENGINEER · HOL_ANALYST · AGENT_USER_ROLE) ──► Access roles (DR_SILVER_RW · DR_GOLD_READ) ──► Schemas (RAW · SILVER · GOLD)
+DOCTORS.DOCTOR_NAME (sensitive column) ──► MP_PERSON_NAME (masking policy) ──► Masked unless allowed
+Market data rows (by country) ──► RAP_COUNTRY + ROLE_COUNTRY_MAP (row access policy) ──► Only your countries
+```
+
+| Functional role | Access roles it gets | So it can |
+| --- | --- | --- |
+| `HOL_ENGINEER` | `DR_SILVER_RW` + `DR_GOLD_READ` | Read RAW, build and write SILVER, read GOLD |
+| `HOL_ANALYST` | `DR_GOLD_READ` | Read GOLD only |
+| `AGENT_USER_ROLE` | `DR_GOLD_READ` | Read GOLD and use the agent |
 
 Most "roles always give us problems" stories come from three habits: granting privileges directly to people-facing roles, creating objects with whatever role happens to be active, and forgetting that new objects do not inherit old grants. This step fixes all three with a design you can copy, then breaks it on purpose so you recognize the error messages, and finishes with column masking and row-level security.
 
@@ -1660,6 +1718,13 @@ SELECT CURRENT_ROLE();   -- back to ACCOUNTADMIN for the next steps
 
 ## Step 7: Semantic View via SQL (~10 min)
 
+**What this step does:** defines the business metrics once, in a semantic view, so the agent and SQL users get the same answer.
+
+```text
+GOLD + RAW tables (the data) ──► SEMANTIC.SV_PHARMA_MARKET (tables · joins · metrics · synonyms) ──► SEMANTIC_VIEW() in SQL (7.3)
+SEMANTIC.SV_PHARMA_MARKET ──► Agent (Step 8) (text-to-SQL)
+```
+
 ### Why a semantic view?
 
 A **semantic view** is a schema-level object that captures business meaning on top of physical tables: logical tables, the relationships between them, *facts* (row-level numeric values), *dimensions* (attributes to group and filter by) and *metrics* (aggregations). Cortex Analyst uses it to translate natural-language questions into correct SQL, and any SQL client can query it with the `SEMANTIC_VIEW()` table function. Synonyms and comments are the context the LLM reads, so treat them as product documentation.
@@ -1891,6 +1956,14 @@ USE ROLE ACCOUNTADMIN;
 
 ## Step 8: Cortex Search + Cortex Agent via SQL (~20 min)
 
+**What this step does:** enriches the field notes with AI, makes them searchable, and creates the agent as code (YAML), granted to the end-user role.
+
+```text
+SV_PHARMA_MARKET (semantic view) ──► market_analytics (tool: numbers)
+FIELD_NOTES_ENRICHED (AI functions) ──► CS_FIELD_NOTES (search service) ──► field_intelligence (tool: field notes)
+AGENT_USER_ROLE (end-user role) ──► APPS.PHARMA_MARKET_AGENT (YAML spec · picks the tool(s)) ──► Answer (numbers + context)
+```
+
 ### 8.1 Enrich field notes with AI functions
 
 We classify each note into a category and extract its sentiment so the search service can filter on them. Remember: `AI_SENTIMENT` returns an OBJECT (read `categories[0]:sentiment`) and `AI_CLASSIFY` returns `labels`.
@@ -2103,6 +2176,13 @@ and a React chat app deployed on Snowflake App Runtime. All code is in this repo
 ---
 
 ## Step 9: Consumption APIs (SQL API & Agents REST API) (~7 min · Instructor demo)
+
+**What this step does:** lets any back end use the platform over HTTP, with the same role-based security as a user in Snowsight.
+
+```text
+Your app / script (any language) ──► PAT (HOL2_API_USER · network policy) ──► SQL API (run SQL) ──► Data (JSON)
+Your app / script ──► PAT ──► Agents REST API (ask the agent) ──► Answer (streamed (SSE))
+```
 
 > **Instructor demo.**  During the session the instructor runs this step live on screen.
 > Everything you need to reproduce it later is below.
